@@ -952,6 +952,26 @@ function Invoke-Install {
         Write-Host ("警告：账户 " + $ChildUser + ' 不在本机用户列表中，仍将继续。') -ForegroundColor Yellow
     }
 
+    # --- 从旧版升级时的权限抢救（必须在写任何文件之前）---
+    # 旧版安装有个 bug（icacls 的容器继承标志对文件无效），会让目录里**每个文件的 ACL
+    # 变成空**。空 DACL 下连管理员都写不进去 —— 因为 owner 只拿到「改权限」的特权，
+    # 没有「写数据」的权限。不先把权限抢回来，下面第一句 Set-Content 就 Access Denied，
+    # 而 $ErrorActionPreference = 'Stop' 会让整个安装直接崩在半路。
+    if (Test-Path -LiteralPath $Root) {
+        try {
+            & takeown.exe /F $Root /R /D Y 2>&1 | Out-Null
+            $adminDirF  = '*S-1-5-32-544:(OI)(CI)(F)'
+            $adminFileF = '*S-1-5-32-544:(F)'
+            & icacls.exe $Root /grant $adminDirF /C 2>&1 | Out-Null
+            Get-ChildItem -LiteralPath $Root -Recurse -Force -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                & icacls.exe $_.FullName /grant $adminDirF /C 2>&1 | Out-Null
+            }
+            Get-ChildItem -LiteralPath $Root -Recurse -Force -File -ErrorAction SilentlyContinue | ForEach-Object {
+                & icacls.exe $_.FullName /grant $adminFileF /C 2>&1 | Out-Null
+            }
+        } catch { }
+    }
+
     New-Item -ItemType Directory -Force -Path $Root, $BakDir | Out-Null
     Set-Content -LiteralPath $CorePath  -Value $CoreCode  -Encoding UTF8
     Set-Content -LiteralPath $AdminPath -Value $AdminCode -Encoding UTF8
@@ -971,15 +991,58 @@ function Invoke-Install {
     Write-Host ('  程序目录写入完成: ' + $Root)
 
     # --- ACL：孩子只读程序/配置，只对自己的日志有写权限 ---
+    #
+    # ⚠️ 这里有个吃过大亏的坑，改之前务必看完：
+    #    icacls 的 (OI)(CI) 是「容器继承」标志，**对文件无效**。
+    #    曾经的写法是 `icacls $Root /inheritance:r /grant ...:(OI)(CI)(RX) /T`，
+    #    对目录没问题，但轮到文件时：/inheritance:r 生效了（把继承来的权限摘掉），
+    #    /grant 却因为带着容器标志被静默跳过 —— 于是每个文件都变成「谁都不能读」。
+    #    表症是计划任务报「加载脚本 runc.vbs 失败（拒绝访问）」，
+    #    而 icacls 看目录权限完全正常，极具迷惑性，实测排查了很久。
+    #    正确做法：目录和文件分开处理，**文件用不带 OI/CI 的权限**。
     $childSid = $null
     try {
         $childSid = (New-Object System.Security.Principal.NTAccount($ChildUser)).Translate([System.Security.Principal.SecurityIdentifier]).Value
     } catch { }
     try {
-        & icacls.exe $Root /inheritance:r /grant '*S-1-5-18:(OI)(CI)(F)' /grant '*S-1-5-32-544:(OI)(CI)(F)' /grant '*S-1-5-32-545:(OI)(CI)(RX)' /T /C | Out-Null
-        & icacls.exe $BakDir /inheritance:r /grant '*S-1-5-18:(OI)(CI)(F)' /grant '*S-1-5-32-544:(OI)(CI)(F)' /C | Out-Null
-        if ($childSid) { & icacls.exe $LogPath /grant ('*' + $childSid + ':(M)') /C | Out-Null }
-        Write-Host '  已设置目录权限（孩子只读，日志可写）'
+        $dirGrant  = @('*S-1-5-18:(OI)(CI)(F)', '*S-1-5-32-544:(OI)(CI)(F)', '*S-1-5-32-545:(OI)(CI)(RX)')
+        $fileGrant = @('*S-1-5-18:(F)',          '*S-1-5-32-544:(F)',          '*S-1-5-32-545:(RX)')
+
+        # 先目录（带继承标志，之后新建的文件会自动继承）
+        & icacls.exe $Root /inheritance:r /grant $dirGrant /C 2>&1 | Out-Null
+        Get-ChildItem -LiteralPath $Root -Recurse -Force -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            & icacls.exe $_.FullName /inheritance:r /grant $dirGrant /C 2>&1 | Out-Null
+        }
+        # 再文件（关键：不带 (OI)(CI)，否则权限根本授不上去）
+        Get-ChildItem -LiteralPath $Root -Recurse -Force -File -ErrorAction SilentlyContinue | ForEach-Object {
+            & icacls.exe $_.FullName /inheritance:r /grant $fileGrant /C 2>&1 | Out-Null
+        }
+
+        # cache 归档只留给 SYSTEM / 管理员
+        $bakDirGrant  = @('*S-1-5-18:(OI)(CI)(F)', '*S-1-5-32-544:(OI)(CI)(F)')
+        $bakFileGrant = @('*S-1-5-18:(F)',          '*S-1-5-32-544:(F)')
+        & icacls.exe $BakDir /inheritance:r /grant $bakDirGrant /C 2>&1 | Out-Null
+        Get-ChildItem -LiteralPath $BakDir -Recurse -Force -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            & icacls.exe $_.FullName /inheritance:r /grant $bakDirGrant /C 2>&1 | Out-Null
+        }
+        Get-ChildItem -LiteralPath $BakDir -Recurse -Force -File -ErrorAction SilentlyContinue | ForEach-Object {
+            & icacls.exe $_.FullName /inheritance:r /grant $bakFileGrant /C 2>&1 | Out-Null
+        }
+
+        # 日志：目标账户可写（否则监控进程记不了日志）
+        if ($childSid) { & icacls.exe $LogPath /grant ('*' + $childSid + ':(M)') /C 2>&1 | Out-Null }
+
+        # 自检：真去读一下 runc.vbs。权限要是没设对，这里必须炸出来，
+        # 而不是等到计划任务弹「拒绝访问」才发现。
+        $probe = ''
+        try { $probe = Get-Content -LiteralPath $VbsCore -Raw -ErrorAction Stop } catch { }
+        if ([string]::IsNullOrWhiteSpace($probe)) {
+            Write-Host '  [警告] 权限设置后 runc.vbs 仍然读不到，计划任务会报「拒绝访问」' -ForegroundColor Red
+            Write-Host '         请把下面这行发给开发者：' -ForegroundColor Red
+            Write-Host ('         icacls "' + $Root + '" /T') -ForegroundColor Red
+        } else {
+            Write-Host '  已设置目录权限（孩子只读，日志可写）'
+        }
     } catch { Write-Host '  权限设置失败，请手动检查 ACL' -ForegroundColor Yellow }
 
     # --- 任务 A：特权（SYSTEM，每 5 分钟 + 开机） ---
